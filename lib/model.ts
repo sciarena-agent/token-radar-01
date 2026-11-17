@@ -103,6 +103,8 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  /** The protocol's risk signal: size, age, momentum and chain breadth, from its own record. */
+  risk: RiskSignal;
   model: {
     base_multiple: number;
     growth_pct: number;
@@ -130,6 +132,10 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   on_watchlist: boolean;
+  /** The risk signal, flat so the page can read it without a nested lookup. */
+  risk_score: number;
+  risk_label: 'Low' | 'Moderate' | 'Elevated';
+  risk_reasons: string[];
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -250,6 +256,57 @@ export function impliedValue(
   return { implied, growthPct, growthMult, maturityMult, age };
 }
 
+/** A protocol's risk signal: a score and a label, derived from the snapshot's own figures. */
+export interface RiskSignal {
+  /** 0..100: higher means riskier. Built from size, age, momentum and chain breadth. */
+  score: number;
+  /** Low below 40, Moderate 40..60, Elevated above 60. */
+  label: 'Low' | 'Moderate' | 'Elevated';
+  /** The short reasons the score moved, in the order they were applied. */
+  reasons: string[];
+}
+
+/** The TVL band a protocol sits in, from its own TVL. */
+function tvlBand(tvl: number): 'mega' | 'large' | 'mid' | 'small' {
+  if (tvl >= 1_000_000_000) return 'mega';
+  if (tvl >= 100_000_000) return 'large';
+  if (tvl >= 10_000_000) return 'mid';
+  return 'small';
+}
+
+/**
+ * A protocol's risk signal, from its own record only: size, age, momentum and chain breadth.
+ * A large, seasoned, steady protocol scores low; a small, young, violently moving one scores
+ * high. The score is a warning, not a verdict: a high-risk protocol can still be worth farming,
+ * it just needs a smaller position and a shorter hold. No name is special-cased.
+ */
+export function riskSignal(p: SnapshotProtocol, age: number | null): RiskSignal {
+  let score = 50;
+  const reasons: string[] = [];
+  // Size: a large TVL is a deeper, more established pool; a small one is easier to move.
+  const band = tvlBand(p.tvl_usd);
+  if (band === 'mega') { score -= 20; reasons.push('TVL above $1B'); }
+  else if (band === 'large') { score -= 10; reasons.push('TVL above $100M'); }
+  else if (band === 'small') { score += 10; reasons.push('TVL below $10M'); }
+  // Age: a protocol that has run for years with no token has survived; a young one has not.
+  if (age !== null && age >= 730) { score -= 15; reasons.push('listed over 2 years ago'); }
+  else if (age !== null && age >= 365) { score -= 5; reasons.push('listed over 1 year ago'); }
+  else if (age !== null && age < 180) { score += 10; reasons.push('listed under 180 days ago'); }
+  else if (age === null) { score += 5; reasons.push('listing date unknown'); }
+  // Momentum: a violent week, up or down, is volatility; a steady week is not.
+  const g = p.change_7d;
+  if (g !== null && Math.abs(g) > 50) { score += 15; reasons.push('7-day move over 50%'); }
+  else if (g !== null && g < -30) { score += 15; reasons.push('TVL down over 30% in 7 days'); }
+  else if (g !== null && g > 30) { score += 5; reasons.push('TVL up over 30% in 7 days'); }
+  // Breadth: one chain is a single point of failure; several chains spread it.
+  const chains = p.chains.length;
+  if (chains <= 1) { score += 5; reasons.push('single chain'); }
+  else if (chains >= 3) { score -= 5; reasons.push(`${chains} chains`); }
+  score = Math.max(0, Math.min(100, score));
+  const label = score < 40 ? 'Low' : score <= 60 ? 'Moderate' : 'Elevated';
+  return { score, label, reasons };
+}
+
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
@@ -307,7 +364,10 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
 
   const scored = [...chosen.values()].map((p) => {
     const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, baseMultiple);
-    return { p, implied, growthPct, growthMult, maturityMult, age };
+    // The risk signal is scored from the same record, beside the implied value: it never
+    // changes the ranking, it only warns the reader how steady the protocol behind it is.
+    const risk = riskSignal(p, age);
+    return { p, implied, growthPct, growthMult, maturityMult, age, risk };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   const board = scored.map((s, i) => ({
@@ -325,6 +385,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     token_status: 'pre-token' as const,
     age_days: s.age,
     implied_value_usd: s.implied,
+    risk: s.risk,
     model: {
       base_multiple: round4(baseMultiple),
       growth_pct: s.growthPct,
@@ -332,7 +393,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
       maturity_multiplier: round4(s.maturityMult),
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_steps: farmSteps(s.p, s.age, s.risk.label).map(stepText),
   }));
   return { board, baseMultiple, derivation };
 }
@@ -372,6 +433,23 @@ function holdDaysFor(age: number | null): number {
 function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
   const name = p.name;
+  // Specific sub-categories first: each of these contains a generic word (yield, lending, stable,
+  // staking, chain, governance, card, index, derivative) that a later branch would catch with a
+  // blunter action, so the narrow match has to win.
+  if (c.includes('yield aggregator')) return `Deposit $${capital} of USDC into ${name}'s auto-compounding vault on ${chain} and let the yield stack.`;
+  if (c.includes('leveraged farming')) return `Deposit $${capital} of USDC into ${name}'s leveraged farm on ${chain} and keep the leverage low.`;
+  if (c.includes('uncollateralized lending')) return `Lend $${capital} of USDC through ${name} on ${chain} and check the borrower's repayment weekly.`;
+  if (c.includes('cdp manager')) return `Open a $${capital} collateralised position with ${name} on ${chain} and watch the collateral ratio.`;
+  if (c.includes('collateral markets')) return `Supply $${capital} of collateral to ${name}'s market on ${chain} and keep the position open.`;
+  if (c.includes('cross chain')) return `Bridge $${capital} of USDC through ${name} to ${chain} and use the bridged funds in its app.`;
+  if (c.includes('dual-token stablecoin')) return `Mint $${capital} of the dual-token stable asset through ${name} on ${chain} and hold both tokens.`;
+  if (c.includes('stablecoin wrapper')) return `Wrap $${capital} of the stable asset through ${name} on ${chain} and hold the wrapped token.`;
+  if (c.includes('staking pool')) return `Stake $${capital} in ${name}'s pool on ${chain} and keep the staking receipt.`;
+  if (c.includes('prediction market')) return `Fund $${capital} and place one prediction-market position on ${name}.`;
+  if (c.includes('governance incentives')) return `Lock $${capital} of the governance asset in ${name} on ${chain}, vote once and claim the incentive.`;
+  if (c.includes('crypto card issuer')) return `Load $${capital} onto the ${name} card and make one payment through it on ${chain}.`;
+  if (c.includes('indexes')) return `Buy $${capital} of the ${name} index on ${chain} and hold it through one rebalance.`;
+  if (c.includes('interest rate derivatives')) return `Deposit $${capital} of USDC into ${name}'s rate market on ${chain} and hold the rate position.`;
   if (c.includes('risk curator') || c.includes('curator')) return `Deposit $${capital} into a ${name} curated vault on ${chain} and keep the vault shares.`;
   if (c.includes('allocator') || c.includes('capital allocator')) return `Deposit $${capital} into a ${name} allocation vault on ${chain} and keep the shares.`;
   if (c.includes('basis trading')) return `Deposit $${capital} of USDC into ${name}'s basis vault on ${chain} and keep the position open.`;
@@ -395,6 +473,20 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
 /** The category's weekly qualifying action, so the plan is not one deposit and silence. */
 function weeklyFor(p: SnapshotProtocol): string {
   const c = (p.category ?? '').toLowerCase();
+  // Specific sub-categories first, for the same reason as in actionFor: the narrow match wins.
+  if (c.includes('yield aggregator')) return 'Check the compounding weekly and top up a little once a month so the vault keeps growing.';
+  if (c.includes('leveraged farming')) return 'Check the leverage ratio each week and unwind a little if the market turns against the position.';
+  if (c.includes('uncollateralized lending')) return 'Check the borrower repayment schedule weekly so a missed payment is caught early.';
+  if (c.includes('cdp manager')) return 'Check the collateral ratio weekly and top up collateral before it nears liquidation.';
+  if (c.includes('collateral markets')) return 'Check the collateral market weekly and add a small amount when the rates are favourable.';
+  if (c.includes('cross chain')) return 'Bridge a small amount each week so the route stays active.';
+  if (c.includes('dual-token stablecoin') || c.includes('stablecoin wrapper')) return 'Check the peg weekly and add a small amount when it holds within its band.';
+  if (c.includes('staking pool')) return 'Claim or restake the pool rewards once a week so the position compounds.';
+  if (c.includes('prediction market')) return 'Settle one market position each week so the account shows steady use.';
+  if (c.includes('governance incentives')) return 'Vote on one proposal each week and claim the incentive so the wallet counts as an active governor.';
+  if (c.includes('crypto card issuer')) return 'Make one card payment a week so the card stays active.';
+  if (c.includes('indexes')) return 'Check the index rebalance weekly and hold through it.';
+  if (c.includes('interest rate derivatives')) return 'Check the rate position weekly and close or roll it before expiry.';
   if (c.includes('lending') || c.includes('cdp') || c.includes('collateral')) return 'Make one qualifying action each week, such as a supply, a borrow or a repayment.';
   if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm') || c.includes('liquidity manager') || c === 'farm') return 'Swap or add liquidity once a week, even a small amount, so the wallet stays active.';
   if (c.includes('derivative') || c.includes('perpetual') || c.includes('interest rate')) return 'Open or close one small hedge each week so the account shows steady use.';
@@ -407,19 +499,39 @@ function weeklyFor(p: SnapshotProtocol): string {
   return 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.';
 }
 
+/** A chain-specific note for the setup step: gas, custody and verification differ by chain. */
+function chainNote(chain: string): string {
+  const c = chain.toLowerCase();
+  if (c === 'ethereum') return 'On Ethereum mainnet, batch your actions and watch gas: do the deposit once, not in pieces.';
+  if (c === 'solana') return 'On Solana, keep a little SOL in the wallet for rent and fees so the position never stalls.';
+  if (c === 'base') return 'On Base, fees are small: one transaction a week is enough to keep the wallet active.';
+  if (c === 'binance') return 'On BNB Chain, keep a little BNB for gas and verify the contract address on the chain explorer.';
+  if (c === 'arbitrum') return 'On Arbitrum, batch the deposit and the weekly action into one visit to save a round trip.';
+  if (c === 'optimism') return 'On Optimism, fees are small: one transaction a week is enough to keep the wallet active.';
+  if (c === 'avalanche') return 'On Avalanche, keep a little AVAX for gas and verify the contract on the chain explorer.';
+  if (c === 'polygon') return 'On Polygon, keep a little POL for gas; fees are small, so a weekly action costs almost nothing.';
+  if (c === 'sui') return 'On Sui, keep a little SUI for gas and store the position object IDs in the farm log.';
+  if (c === 'aptos') return 'On Aptos, keep a little APT for gas and store the position object IDs in the farm log.';
+  if (c === 'monad') return 'On Monad, keep a little MON for gas and verify the contract on the chain explorer.';
+  if (c === 'hyperliquid l1') return 'On Hyperliquid, do the position in the chain\u2019s own app and check its points page there.';
+  if (c === 'berachain') return 'On Berachain, keep a little BERA for gas and verify the contract on the chain explorer.';
+  if (c === 'bitcoin') return 'On Bitcoin, use the protocol\u2019s own app and keep the wallet recovery phrase offline.';
+  return `On ${chain}, keep a little of the chain\u2019s gas token in the wallet so the position never stalls.`;
+}
+
 /**
  * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of
  * names.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, riskLabel: RiskSignal['label'] = 'Moderate'): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
   return [
     {
-      text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
+      text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. ${chainNote(chain)}`,
       cost: 'under $3 of gas for the first transaction',
       time: '5 minutes',
     },
@@ -434,7 +546,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '10 minutes a week',
     },
     {
-      text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`,
+      text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.${riskLabel === 'Elevated' ? ' This protocol is flagged Elevated risk, so keep the position small and unwind if its TVL falls by a third.' : ''}`,
       cost: `the $${capital} stays in the position`,
       time: `${hold} days`,
     },
@@ -486,6 +598,9 @@ export function radarRow(row: BoardRow, onWatchlist: boolean): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     on_watchlist: onWatchlist,
+    risk_score: row.risk.score,
+    risk_label: row.risk.label,
+    risk_reasons: row.risk.reasons,
   };
 }
 
