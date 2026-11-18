@@ -3,15 +3,18 @@
 // inputs and the protocol's farm plan. No network: every byte it shows is in data.js.
 //
 // The model, in one function, so the page and board.json are visibly the same arithmetic:
-//   implied = round( tvl_usd x M x G x A )
-//   M = the base multiple, the median FDV/TVL of the snapshot's live-token protocols, computed by
-//       main.ts from the snapshot and carried in DATA.base_multiple. It is the market's own
-//       multiple, not a picked number; the dashboard's model panel shows the live count and the
-//       quartiles it was read from.
+//   implied = round( tvl_usd x M(tvl_usd) x G x A )
+//   M = the fitted multiple, read off the comps curve at the protocol's own TVL: the curve is
+//       log(FDV) = intercept + slope x log(TVL), fit by OLS on the snapshot's live-token
+//       protocols and carried in DATA.curve; the multiple is exp(intercept) x TVL^(slope - 1),
+//       clamped to [0.05, 0.50]. Each row carries its own fitted multiple in base_multiple,
+//       so the page recomputes the row from the same rounded number board.json carries.
 //   G = 1 + clamp(change_7d, -60, 120) / 100 x 0.5   (momentum, clamped so one wild week cannot
 //       decide a ranking; the snapshot holds a +4448% print)
 //   A = 0.6 + min(age_days, 1095) / 1095 x 0.4       (seasoning: how long it has run with no token;
 //       an unknown age scores 365 days)
+// The model panel shows the curve's fit and its out-of-sample test against the old one-median
+// model, so the reader can see the curve earns its place.
 (function () {
   'use strict';
 
@@ -37,12 +40,15 @@
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
     return Math.max(0, Math.round(days)) + 'd';
   }
-  function impliedOf(row, model, baseMultiple) {
+  // The row's own fitted multiple, read off the comps curve at its TVL by main.ts and carried
+  // in base_multiple: the page recomputes the row from the same rounded number board.json
+  // carries, so the two agree to the dollar.
+  function impliedOf(row, model) {
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-    return Math.max(1, Math.round(row.tvl_usd * baseMultiple * growthMult * maturity));
+    return Math.max(1, Math.round(row.tvl_usd * row.base_multiple * growthMult * maturity));
   }
 
   function el(tag, attrs) {
@@ -173,17 +179,47 @@
     if (c === 'bitcoin') return 'On Bitcoin, use the protocol\u2019s own app and keep the wallet recovery phrase offline.';
     return 'On ' + chain + ', keep a little of the chain\u2019s gas token in the wallet so the position never stalls.';
   }
+  // A dollar figure with no more precision than it earns: whole dollars stay whole, cents stay
+  // cents. The wording matches lib/model.ts exactly, so the page and board.json agree.
+  function money(n) {
+    var r = Math.round(n * 100) / 100;
+    return Number.isInteger(r) ? String(r) : r.toFixed(2);
+  }
+  // A typical fee for one transaction on a chain, in USD: Ethereum mainnet is dollars, Solana
+  // and the cheap L2s are cents. Chains the table does not name use the $0.50 default.
+  var CHAIN_FEE_USD = {
+    ethereum: 3.0, bitcoin: 2.0, tron: 0.25, arbitrum: 0.1, avalanche: 0.1, binance: 0.1,
+    base: 0.05, optimism: 0.05, monad: 0.05, berachain: 0.05, mantle: 0.05, 'zksync era': 0.05,
+    polygon: 0.02, flare: 0.02, solana: 0.01, sui: 0.01, aptos: 0.01, stellar: 0.01,
+    ripple: 0.01, provenance: 0.01, 'hyperliquid l1': 0.01
+  };
+  function chainFee(chain) {
+    var fee = CHAIN_FEE_USD[String(chain).toLowerCase()];
+    return fee === undefined ? 0.5 : fee;
+  }
   function farmSteps(p) {
     var chain = chainOf(p);
     var capital = capitalFor(p);
     var hold = holdDaysFor(p.age_days);
+    var fee = chainFee(chain);
+    // The plan's transactions: 1 to set up, 2 to approve and deposit, 1 a week, 1 to claim.
+    var weeks = Math.max(1, Math.ceil(hold / 7));
+    var totalGas = (4 + weeks) * fee;
+    // The model's expected airdrop for this deposit: the deposit's share of the implied value.
+    var growth = Math.min(DATA.model.growth_cap, Math.max(DATA.model.growth_floor, p.change_7d === null || p.change_7d === undefined ? 0 : p.change_7d));
+    var growthMult = 1 + (growth / 100) * DATA.model.growth_weight;
+    var age = p.age_days === null || p.age_days === undefined ? DATA.model.unknown_age_days : p.age_days;
+    var maturityMult = DATA.model.maturity_floor + (Math.min(Math.max(age, 0), DATA.model.maturity_days) / DATA.model.maturity_days) * DATA.model.maturity_range;
+    var expected = capital * p.base_multiple * growthMult * maturityMult;
+    var net = expected - totalGas;
+    var breakeven = Math.ceil(totalGas / Math.max(1e-9, p.base_multiple * growthMult * maturityMult) / 50) * 50;
     return [
-      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. ' + chainNote(chain), cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
-      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
-      { text: weeklyFor(p), cost: 'about $2 of gas a week', time: '10 minutes a week' },
+      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. ' + chainNote(chain), cost: 'about $' + money(fee) + ' of gas for the first transaction', time: '5 minutes' },
+      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + money(2 * fee) + ' of gas', time: '15 minutes to set up' },
+      { text: weeklyFor(p), cost: 'about $' + money(fee) + ' of gas a week', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.' + (p.risk_label === 'Elevated' ? ' This protocol is flagged Elevated risk, so keep the position small and unwind if its TVL falls by a third.' : ''), cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
-      { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' }
+      { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'one transaction of gas to claim, and never pay a site to claim', time: '10 minutes' },
+      { text: 'Add it up: a $' + capital + ' deposit, about $' + money(totalGas) + ' of gas over ' + hold + ' days, and an expected airdrop of about $' + money(expected) + " at this protocol's implied multiple \u2014 a net of about " + (net < 0 ? '-' : '') + '$' + money(Math.abs(net)) + '.' + (net < 0 ? ' The gas outweighs the expected airdrop at this size: size the deposit past $' + breakeven + ' so the fees are a smaller share, or skip this one.' : ' The plan pays for itself at this size.'), cost: 'about $' + money(totalGas) + ' of gas in total', time: hold + ' days' }
     ].map(stepText);
   }
 
@@ -437,21 +473,35 @@
   function modelPanel() {
     var m = DATA.model;
     var mult = DATA.multiple;
+    var curve = DATA.curve;
+    var val = DATA.validation;
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        el('span', { text: 'implied = round( tvl_usd x ' }),
-        el('b', { text: String(DATA.base_multiple) }),
-        el('span', { text: ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )' })
+        el('span', { text: 'implied = round( tvl_usd x multiple(tvl_usd) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )' }),
+        el('br'),
+        el('span', { text: 'multiple(tvl) = clamp( exp(' }),
+        el('b', { text: String(curve.intercept) }),
+        el('span', { text: ') x tvl^(' }),
+        el('b', { text: String(curve.slope - 1) }),
+        el('span', { text: '), ' + curve.multiple_floor + ', ' + curve.multiple_cap + ' )' })
       ),
       el('div', { class: 'derived' },
-        el('div', null, el('span', { text: 'Base multiple (median FDV/TVL)' }), el('b', { text: String(DATA.base_multiple) })),
-        el('div', null, el('span', { text: 'Live protocols it is read from' }), el('b', { text: String(mult.live_count) })),
-        el('div', null, el('span', { text: 'FDV/TVL, 25th percentile' }), el('b', { text: String(mult.p25) })),
-        el('div', null, el('span', { text: 'FDV/TVL, 75th percentile' }), el('b', { text: String(mult.p75) }))
+        el('div', null, el('span', { text: 'Fitted curve, log FDV on log TVL' }), el('b', { text: 'log FDV = ' + curve.intercept + ' + ' + curve.slope + ' x log TVL' })),
+        el('div', null, el('span', { text: 'Live protocols the curve is fit on' }), el('b', { text: String(curve.n) })),
+        el('div', null, el('span', { text: 'R² of the fit' }), el('b', { text: String(curve.r2) })),
+        el('div', null, el('span', { text: 'Multiple at the clamp floor / cap' }), el('b', { text: curve.at_floor + ' / ' + curve.at_cap + ' rows' }))
       ),
-      el('p', { class: 'sub', text: 'The base multiple is the median market-cap-to-TVL ratio of the ' + mult.live_count + ' live-token protocols in this snapshot that record a market cap: the market\u2019s own multiple, read from the data, not a number picked by hand. TVL and seven-day growth come from the snapshot; age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The live-token protocols are set aside with their market caps shown.' })
+      el('h3', { text: 'Model validation: fitted, not assumed' }),
+      el('p', { class: 'sub', text: 'The live set is split 80/20 by a seeded hash of the slug, the curve is fit on the ' + val.train_n + ' it is allowed to see and scored on the ' + val.test_n + ' it never saw, and the same test is run for the old one-median model. The fitted curve wins out of sample, so it earns its place on the board; the fit is still noisy, and the numbers say so.' }),
+      el('div', { class: 'derived' },
+        el('div', null, el('span', { text: 'Out-of-sample error, fitted curve' }), el('b', { text: String(val.fitted_median_log_error) + ' log points' })),
+        el('div', null, el('span', { text: 'Out-of-sample error, one median' }), el('b', { text: String(val.median_median_log_error) + ' log points' })),
+        el('div', null, el('span', { text: 'Train-half fit, for the honest test' }), el('b', { text: 'log FDV = ' + val.train_intercept + ' + ' + val.train_slope + ' x log TVL, R² ' + val.train_r2 })),
+        el('div', null, el('span', { text: 'One-median baseline, train half' }), el('b', { text: 'multiple ' + val.train_median_multiple }))
+      ),
+      el('p', { class: 'sub', text: 'A large protocol trades at a lower multiple than a small one: the fitted slope is ' + curve.slope + ', below 1, so the multiple falls as TVL grows. The one-median model it replaces used ' + mult.median + ' for every size (25th percentile ' + mult.p25 + ', 75th ' + mult.p75 + ', ' + mult.live_count + ' live protocols). The multiple is clamped to [' + curve.multiple_floor + ', ' + curve.multiple_cap + ']: ' + curve.at_floor + ' rows sit on the floor and ' + curve.at_cap + ' on the cap. TVL and seven-day growth come from the snapshot; age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The live-token protocols are set aside with their market caps shown.' })
     );
   }
 
@@ -465,7 +515,7 @@
     writeHash();
     dialog.textContent = '';
     var steps = farmSteps(row);
-    var recomputed = impliedOf(row, DATA.model, DATA.base_multiple);
+    var recomputed = impliedOf(row, DATA.model);
     var why = row.rank <= 3
       ? 'One of the largest pre-token footprints in the snapshot: its TVL alone puts it at the top, and its growth and seasoning hold the value there.'
       : row.change_7d !== null && row.change_7d > 10
@@ -487,7 +537,7 @@
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Base multiple (market median)' }), el('b', { class: 'num', text: String(row.base_multiple) })),
+        el('div', null, el('span', { text: 'Fitted multiple (comps curve, at this TVL)' }), el('b', { class: 'num', text: String(row.base_multiple) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
         el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))

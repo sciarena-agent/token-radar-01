@@ -86,6 +86,6 @@ for (const name of shots) {
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside), base multiple ${radar.base_multiple} from ${radar.multiple.live_count} live protocols\n` +
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside), fitted curve logFDV = ${radar.curve.intercept} + ${radar.curve.slope} x logTVL (R2 ${radar.curve.r2}, n=${radar.curve.n}; out-of-sample median log error fitted ${radar.validation.fitted_median_log_error} vs median ${radar.validation.median_median_log_error} on ${radar.validation.test_n} held out)\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')}, ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

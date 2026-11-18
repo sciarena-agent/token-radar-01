@@ -9,11 +9,12 @@
 //
 // Implied value is one function of the snapshot's own figures, the same for every row:
 //
-//   implied = round( tvl_usd x M x G x A )
+//   implied = round( tvl_usd x M(tvl_usd) x G x A )
 //
-//   M  base multiple = the median FDV/TVL of the snapshot's live-token protocols, computed at
-//      runtime from the snapshot itself (144 live protocols here carry a market cap; their median
-//      ratio is 0.169). It is the market's own multiple, not a number picked by hand, and it is
+//   M  fitted multiple = the comps curve, fit by ordinary least squares on the snapshot's
+//      live-token protocols: log(FDV) = a + b x log(TVL). A large protocol trades at a lower
+//      multiple than a small one (the fitted slope is below 1), so the multiple is read off
+//      the curve at the protocol's own TVL instead of one median for every size. It is
 //      clamped to [0.05, 0.50] so a skewed live set cannot drag it to an absurd value.
 //   G  growth = 1 + clamp(change_7d, -60, 120) / 100 x 0.5. A protocol gaining TVL is worth more
 //      than one losing it; the clamp keeps one wild week (the snapshot holds a +4448% print) from
@@ -23,8 +24,12 @@
 //      with no listed date is scored at 365 days. Seasoning raises value, but it saturates: the
 //      third year adds little over the second.
 //
-// No protocol name is ever special-cased: the same function scores every row, and the dashboard
-// recomputes each row from the same figures so the page and board.json agree.
+// The curve is validated, not assumed: the live set is split 80/20 by a seeded hash of the
+// slug, the curve is fit on the 80% and scored on the 20% it never saw, and the same test is
+// run for the old one-median model. The dashboard shows both out-of-sample errors, so the
+// reader can see the curve earns its place. No protocol name is ever special-cased: the same
+// function scores every row, and the dashboard recomputes each row from the same figures so
+// the page and board.json agree.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -75,7 +80,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -158,6 +163,42 @@ export interface MultipleDerivation {
   clamped: boolean;
 }
 
+/** The fitted comps curve: log(FDV) = intercept + slope x log(TVL), fit by OLS on the live set. */
+export interface CompsCurve {
+  /** The OLS intercept, log(FDV) at log(TVL) = 0. */
+  intercept: number;
+  /** The OLS slope: below 1 means larger protocols trade at a lower multiple. */
+  slope: number;
+  /** R² of the log-log fit on the whole live set. */
+  r2: number;
+  /** The live protocols the curve was fit on. */
+  n: number;
+  /** The residual standard deviation, in log points. */
+  residual_sd: number;
+  /** The clamp applied to the curve's multiple, from the model constants. */
+  multiple_floor: number;
+  multiple_cap: number;
+  /** Board rows whose raw curve multiple hit each clamp bound. */
+  at_floor: number;
+  at_cap: number;
+}
+
+/** The model's out-of-sample validation: a seeded 80/20 split of the live set. */
+export interface ModelValidation {
+  /** Live protocols in the train and test halves. */
+  train_n: number;
+  test_n: number;
+  /** The curve fit on the train half only, for the honest comparison. */
+  train_intercept: number;
+  train_slope: number;
+  train_r2: number;
+  /** Median absolute log error on the held-out test set: fitted curve vs one median multiple. */
+  fitted_median_log_error: number;
+  median_median_log_error: number;
+  /** The median multiple the baseline used, fit on the train half only. */
+  train_median_multiple: number;
+}
+
 /** Everything the dashboard needs: the board, the live set, and the model it runs. */
 export interface RadarData {
   as_of: string;
@@ -167,6 +208,10 @@ export interface RadarData {
   model_version: string;
   base_multiple: number;
   multiple: MultipleDerivation;
+  /** The fitted comps curve the board's multiples are read from. */
+  curve: CompsCurve;
+  /** The out-of-sample test of the curve against the old one-median model. */
+  validation: ModelValidation;
   watchlist_size: number;
   board_size: number;
   early_size: number;
@@ -255,6 +300,105 @@ export function impliedValue(
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
   return { implied, growthPct, growthMult, maturityMult, age };
 }
+
+/** A djb2 hash of a slug, for the deterministic train/test split: the same snapshot always splits the same way. */
+function slugHash(slug: string): number {
+  let h = 5381;
+  for (let i = 0; i < slug.length; i++) h = ((h << 5) + h + slug.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+/** Ordinary least squares on log(TVL) -> log(market cap): intercept, slope, R² and residual spread. */
+function olsLogLog(points: { tvl: number; mcap: number }[]): { intercept: number; slope: number; r2: number; residualSd: number } {
+  const pts = points.map((p) => [Math.log(p.tvl), Math.log(p.mcap)] as const);
+  const n = pts.length;
+  const mx = pts.reduce((a, p) => a + p[0], 0) / n;
+  const my = pts.reduce((a, p) => a + p[1], 0) / n;
+  let sxx = 0;
+  let sxy = 0;
+  let syy = 0;
+  for (const [x, y] of pts) {
+    sxx += (x - mx) ** 2;
+    sxy += (x - mx) * (y - my);
+    syy += (y - my) ** 2;
+  }
+  const slope = sxx === 0 ? 1 : sxy / sxx;
+  const intercept = my - slope * mx;
+  const r2 = sxx === 0 || syy === 0 ? 0 : (sxy * sxy) / (sxx * syy);
+  const residualSd = Math.sqrt(pts.reduce((a, [x, y]) => a + (y - (intercept + slope * x)) ** 2, 0) / Math.max(1, n));
+  return { intercept, slope, r2, residualSd };
+}
+
+/** The live set: every protocol that records both a token market cap and a positive TVL. */
+function liveSet(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+}
+
+/**
+ * The fitted comps curve, from the snapshot's whole live set, plus its out-of-sample
+ * validation. The validation splits the live set 80/20 by a seeded hash of the slug, fits the
+ * curve on the 80% it is allowed to see, and scores it on the 20% it never saw — and does the
+ * same for the old one-median model, so the dashboard can show whether the curve earns its
+ * place. The board itself is scored with the curve fit on all live protocols: the split is
+ * the test, not the model.
+ */
+export function fitCompsCurve(
+  snapshot: Snapshot,
+  model: ModelConstants,
+): { curve: CompsCurve; validation: ModelValidation; medianMultiple: number; median: MultipleDerivation } {
+  const live = liveSet(snapshot);
+  const full = olsLogLog(live.map((p) => ({ tvl: p.tvl_usd, mcap: p.mcap_usd as number })));
+  const train = live.filter((p) => slugHash(p.slug) % 5 !== 0);
+  const test = live.filter((p) => slugHash(p.slug) % 5 === 0);
+  const trainFit = olsLogLog(train.map((p) => ({ tvl: p.tvl_usd, mcap: p.mcap_usd as number })));
+  const trainRatios = train.map((p) => (p.mcap_usd as number) / p.tvl_usd).sort((a, b) => a - b);
+  const trainMedian = medianOf(trainRatios, 0.25);
+  const absErr = (errors: number[]): number => medianOf([...errors].sort((a, b) => a - b), 0);
+  const fittedErr = absErr(test.map((p) => Math.abs(Math.log(p.mcap_usd as number) - (trainFit.intercept + trainFit.slope * Math.log(p.tvl_usd)))));
+  const medianErr = absErr(test.map((p) => Math.abs(Math.log(p.mcap_usd as number) - (Math.log(p.tvl_usd) + Math.log(trainMedian)))));
+  const { multiple: medianMultiple, derivation: median } = deriveMultiple(snapshot, model);
+  return {
+    curve: {
+      intercept: round2(full.intercept),
+      slope: round2(full.slope),
+      r2: round2(full.r2),
+      n: live.length,
+      residual_sd: round2(full.residualSd),
+      multiple_floor: model.multiple_floor,
+      multiple_cap: model.multiple_cap,
+      at_floor: 0,
+      at_cap: 0,
+    },
+    validation: {
+      train_n: train.length,
+      test_n: test.length,
+      train_intercept: round2(trainFit.intercept),
+      train_slope: round2(trainFit.slope),
+      train_r2: round2(trainFit.r2),
+      fitted_median_log_error: round2(fittedErr),
+      median_median_log_error: round2(medianErr),
+      train_median_multiple: round4(trainMedian),
+    },
+    medianMultiple,
+    median,
+  };
+}
+
+/** The curve's raw multiple at one TVL, before the clamp: exp(a) x TVL^(b - 1). */
+function rawMultiple(tvl: number, curve: CompsCurve): number {
+  return Math.exp(curve.intercept) * Math.pow(tvl, curve.slope - 1);
+}
+
+/**
+ * The fitted multiple for one TVL: the curve's implied FDV/TVL, clamped to the sane range.
+ * The clamp is the same [0.05, 0.50] the median model used, so the curve can bend the
+ * multiple with size but cannot push it to an absurd value at either end.
+ */
+export function fittedMultiple(tvl: number, curve: CompsCurve): number {
+  return round4(Math.min(curve.multiple_cap, Math.max(curve.multiple_floor, rawMultiple(tvl, curve))));
+}
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
 
 /** A protocol's risk signal: a score and a label, derived from the snapshot's own figures. */
 export interface RiskSignal {
@@ -346,8 +490,8 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; baseMultiple: number; derivation: MultipleDerivation } {
-  const { multiple: baseMultiple, derivation } = deriveMultiple(snapshot, model);
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; baseMultiple: number; derivation: MultipleDerivation; curve: CompsCurve; validation: ModelValidation } {
+  const { curve, validation, medianMultiple, median: derivation } = fitCompsCurve(snapshot, model);
   const index = bySlug(snapshot.protocols);
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot,
   // but the board's coverage is the gate's row and is never gambled on a missing record).
@@ -362,13 +506,23 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     if (!chosen.has(p.slug) && isRankable(p)) chosen.set(p.slug, p);
   }
 
+  let atFloor = 0;
+  let atCap = 0;
   const scored = [...chosen.values()].map((p) => {
+    // The multiple is read off the fitted curve at this protocol's own TVL: a large protocol
+    // trades at a lower multiple than a small one, and the clamp keeps either end sane.
+    const raw = rawMultiple(p.tvl_usd, curve);
+    if (raw <= model.multiple_floor) atFloor++;
+    else if (raw >= model.multiple_cap) atCap++;
+    const baseMultiple = fittedMultiple(p.tvl_usd, curve);
     const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, baseMultiple);
     // The risk signal is scored from the same record, beside the implied value: it never
     // changes the ranking, it only warns the reader how steady the protocol behind it is.
     const risk = riskSignal(p, age);
-    return { p, implied, growthPct, growthMult, maturityMult, age, risk };
+    return { p, implied, growthPct, growthMult, maturityMult, age, risk, baseMultiple };
   });
+  curve.at_floor = atFloor;
+  curve.at_cap = atCap;
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   const board = scored.map((s, i) => ({
     rank: i + 1,
@@ -387,15 +541,15 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     implied_value_usd: s.implied,
     risk: s.risk,
     model: {
-      base_multiple: round4(baseMultiple),
+      base_multiple: round4(s.baseMultiple),
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age, s.risk.label).map(stepText),
+    farm_steps: farmSteps(s.p, s.age, s.risk.label, s.baseMultiple, s.growthMult, s.maturityMult).map(stepText),
   }));
-  return { board, baseMultiple, derivation };
+  return { board, baseMultiple: medianMultiple, derivation, curve, validation };
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -519,30 +673,92 @@ function chainNote(chain: string): string {
   return `On ${chain}, keep a little of the chain\u2019s gas token in the wallet so the position never stalls.`;
 }
 
+/** A dollar figure with no more precision than it earns: whole dollars stay whole, cents stay cents. */
+function money(n: number): string {
+  const r = Math.round(n * 100) / 100;
+  return Number.isInteger(r) ? String(r) : r.toFixed(2);
+}
+
+/**
+ * A typical fee for one transaction on a chain, in USD. These are estimates from the usual
+ * cost of a simple transaction, not quotes: Ethereum mainnet is dollars, Solana and the cheap
+ * L2s are cents. Chains the table does not name use the default, so a chain the snapshot
+ * adds later never breaks the plan. The table names the chains the board's first-chain column
+ * actually uses, plus the big ones.
+ */
+const CHAIN_FEE_USD: Record<string, number> = {
+  ethereum: 3.0,
+  bitcoin: 2.0,
+  tron: 0.25,
+  arbitrum: 0.1,
+  avalanche: 0.1,
+  binance: 0.1,
+  base: 0.05,
+  optimism: 0.05,
+  monad: 0.05,
+  berachain: 0.05,
+  mantle: 0.05,
+  'zksync era': 0.05,
+  polygon: 0.02,
+  flare: 0.02,
+  solana: 0.01,
+  sui: 0.01,
+  aptos: 0.01,
+  stellar: 0.01,
+  ripple: 0.01,
+  provenance: 0.01,
+  'hyperliquid l1': 0.01,
+};
+const DEFAULT_CHAIN_FEE_USD = 0.5;
+
+/** The typical fee for one transaction on `chain`, in USD. */
+export function chainFee(chain: string): number {
+  return CHAIN_FEE_USD[chain.toLowerCase()] ?? DEFAULT_CHAIN_FEE_USD;
+}
+
 /**
  * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of
- * names.
+ * names. It is deposit-sized and costed: the deposit follows the TVL band, every fee is the
+ * chain's typical per-transaction cost, and the last step nets the plan — the expected airdrop
+ * at this protocol's implied multiple, minus the gas the plan spends. A negative net is not
+ * hidden: the plan says so and names the deposit that would turn it positive, or tells the
+ * reader to skip.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null, riskLabel: RiskSignal['label'] = 'Moderate'): FarmStep[] {
+export function farmSteps(
+  p: SnapshotProtocol,
+  age: number | null,
+  riskLabel: RiskSignal['label'] = 'Moderate',
+  multiple = 0.2227,
+  growthMult = 1,
+  maturityMult = 1,
+): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
+  const fee = chainFee(chain);
+  // The plan's transactions: 1 to set up, 2 to approve and deposit, 1 a week, 1 to claim.
+  const weeks = Math.max(1, Math.ceil(hold / 7));
+  const totalGas = (4 + weeks) * fee;
+  // The model's expected airdrop for this deposit: the deposit's share of the implied value.
+  const expected = capital * multiple * growthMult * maturityMult;
+  const net = expected - totalGas;
+  const breakeven = Math.ceil(totalGas / Math.max(1e-9, multiple * growthMult * maturityMult) / 50) * 50;
   const action = actionFor(p, capital, chain);
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. ${chainNote(chain)}`,
-      cost: 'under $3 of gas for the first transaction',
+      cost: `about $${money(fee)} of gas for the first transaction`,
       time: '5 minutes',
     },
     {
       text: action,
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      cost: `$${capital} of capital and about $${money(2 * fee)} of gas`,
       time: '15 minutes to set up',
     },
     {
       text: weeklyFor(p),
-      cost: 'about $2 of gas a week',
+      cost: `about $${money(fee)} of gas a week`,
       time: '10 minutes a week',
     },
     {
@@ -552,13 +768,17 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, riskLabel: Ri
     },
     {
       text: `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.`,
-      cost: 'no fee to check, and never pay to claim',
+      cost: 'one transaction of gas to claim, and never pay a site to claim',
       time: '10 minutes',
     },
     {
-      text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`,
-      cost: 'nothing but the log',
-      time: '5 minutes',
+      text:
+        `Add it up: a $${capital} deposit, about $${money(totalGas)} of gas over ${hold} days, and an expected airdrop of about $${money(expected)} at this protocol's implied multiple — a net of about ${net < 0 ? '-' : ''}$${money(Math.abs(net))}.` +
+        (net < 0
+          ? ` The gas outweighs the expected airdrop at this size: size the deposit past $${breakeven} so the fees are a smaller share, or skip this one.`
+          : ` The plan pays for itself at this size.`),
+      cost: `about $${money(totalGas)} of gas in total`,
+      time: `${hold} days`,
     },
   ];
 }
@@ -606,7 +826,7 @@ export function radarRow(row: BoardRow, onWatchlist: boolean): RadarRow {
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const { board, baseMultiple, derivation } = buildBoard(snapshot, model);
+  const { board, baseMultiple, derivation, curve, validation } = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
@@ -617,6 +837,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     model_version: MODEL_VERSION,
     base_multiple: round4(baseMultiple),
     multiple: derivation,
+    curve,
+    validation,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
