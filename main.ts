@@ -85,8 +85,16 @@ for (const name of shots) {
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
+const farmCounts = { FARM: 0, THIN: 0, SKIP: 0 };
+for (const r of board) farmCounts[r.farm.verdict]++;
+const farmNets = board.map((r) => r.farm.net_usd).sort((a, b) => a - b);
+const farmMedianNet = farmNets[Math.floor(farmNets.length / 2)];
+const topFarm = [...board].sort((a, b) => b.farm.per_hour_usd - a.farm.per_hour_usd)[0]!;
+
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside), fitted curve logFDV = ${radar.curve.intercept} + ${radar.curve.slope} x logTVL (R2 ${radar.curve.r2}, n=${radar.curve.n}; out-of-sample median log error fitted ${radar.validation.fitted_median_log_error} vs median ${radar.validation.median_median_log_error} on ${radar.validation.test_n} held out)\n` +
     `token radar: category model logFDV = curve + offset(category), ${radar.curve.categories.length} categories, R2 ${radar.curve.category_r2}, residual SD ${radar.curve.category_residual_sd}, out-of-sample median log error ${radar.validation.category_median_log_error} (k=${MODEL.category_shrink_k} shrinkage)\n` +
+    `token radar: launch odds Brier ${radar.odds.brier_holdout} held out vs ${radar.odds.brier_holdout_base} base rate (CV5 ${radar.odds.brier_cv5} vs ${radar.odds.brier_cv5_base}); LOO flat ${radar.extended.loo.flat} / curve ${radar.extended.loo.curve} / category ${radar.extended.loo.cat}; P10-P90 x${radar.intervals.mult_q10}..x${radar.intervals.mult_q90} (coverage ${radar.intervals.coverage_split} on the split); bootstrap median rank spread ${radar.bootstrap.median_spread}; ledger ${radar.ledger.scanned} = ${radar.ledger.ranked} ranked + ${radar.ledger.token_on_record} token on record + ${radar.ledger.excluded_total} excluded\n` +
+    `token radar: farm $${MODEL.farm_ticket} ticket: FARM ${farmCounts.FARM} / THIN ${farmCounts.THIN} / SKIP ${farmCounts.SKIP}, median net $${farmMedianNet}, top $/h $${topFarm.farm.per_hour_usd} (${topFarm.slug})\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')}, ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
