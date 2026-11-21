@@ -9,13 +9,19 @@
 //
 // Implied value is one function of the snapshot's own figures, the same for every row:
 //
-//   implied = round( tvl_usd x M(tvl_usd) x G x A )
+//   implied = round( tvl_usd x M(tvl_usd) x C(category) x G x A )
 //
 //   M  fitted multiple = the comps curve, fit by ordinary least squares on the snapshot's
 //      live-token protocols: log(FDV) = a + b x log(TVL). A large protocol trades at a lower
 //      multiple than a small one (the fitted slope is below 1), so the multiple is read off
 //      the curve at the protocol's own TVL instead of one median for every size. It is
 //      clamped to [0.05, 0.50] so a skewed live set cannot drag it to an absurd value.
+//   C  category factor = exp(offset), where offset is the category's shrunk mean residual
+//      from the curve: (n / (n + 10)) x the mean of log(mcap) - curve prediction over the
+//      live protocols of that category. A category whose live protocols trade above the
+//      curve scores above 1, one below it scores below 1; a category with no live protocol
+//      scores 1. The factor multiplies after the clamp, so the clamp governs the curve
+//      multiple only: a row's final implied multiple can sit outside [0.05, 0.50].
 //   G  growth = 1 + clamp(change_7d, -60, 120) / 100 x 0.5. A protocol gaining TVL is worth more
 //      than one losing it; the clamp keeps one wild week (the snapshot holds a +4448% print) from
 //      deciding the ranking.
@@ -24,10 +30,14 @@
 //      with no listed date is scored at 365 days. Seasoning raises value, but it saturates: the
 //      third year adds little over the second.
 //
-// The curve is validated, not assumed: the live set is split 80/20 by a seeded hash of the
-// slug, the curve is fit on the 80% and scored on the 20% it never saw, and the same test is
-// run for the old one-median model. The dashboard shows both out-of-sample errors, so the
-// reader can see the curve earns its place. No protocol name is ever special-cased: the same
+// G and A are stated assumptions, not fitted values: fitting them on the live set gives
+// negative coefficients, so the model does not claim the market rewards growth or age — it
+// states them as the radar's own judgement, and says so on the dashboard. The fitted parts
+// are the curve and the category offsets; both are validated, not assumed: the live set is
+// split 80/20 by a seeded hash of the slug, the curve and the offsets are fit on the 80%
+// and scored on the 20% they never saw, and the same test is run for the old one-median
+// model. The dashboard shows all three out-of-sample errors, so the reader can see the
+// category model earns its place. No protocol name is ever special-cased: the same
 // function scores every row, and the dashboard recomputes each row from the same figures so
 // the page and board.json agree.
 
@@ -65,6 +75,8 @@ export interface ModelConstants {
   unknown_age_days: number;
   multiple_floor: number;
   multiple_cap: number;
+  /** The shrinkage strength of the category offsets: offset = (n / (n + k)) x mean residual. */
+  category_shrink_k: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -77,10 +89,11 @@ export const MODEL: ModelConstants = {
   unknown_age_days: 365,
   multiple_floor: 0.05,
   multiple_cap: 0.5,
+  category_shrink_k: 10,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -112,6 +125,8 @@ export interface BoardRow {
   risk: RiskSignal;
   model: {
     base_multiple: number;
+    /** The row's category factor: exp(offset) for its category, 1 when the category has no live protocol. Multiplies after the clamp. */
+    category_factor: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -134,6 +149,8 @@ export interface RadarRow {
   age_days: number | null;
   implied_value_usd: number;
   base_multiple: number;
+  /** The row's category factor, so the page recomputes the row with the same number board.json carries. */
+  category_factor: number;
   growth_multiplier: number;
   maturity_multiplier: number;
   on_watchlist: boolean;
@@ -163,6 +180,18 @@ export interface MultipleDerivation {
   clamped: boolean;
 }
 
+/** One category's fitted adjustment: how far its live protocols sit from the curve. */
+export interface CategoryOffset {
+  /** The category as the snapshot names it, or 'Unknown' when it names none. */
+  category: string;
+  /** Live protocols in this category the offset is fit on. */
+  n: number;
+  /** The shrunk mean residual, in log points: (n / (n + k)) x the category's mean residual. */
+  offset_log: number;
+  /** exp(offset_log): the factor the board multiplies the curve multiple by. */
+  factor: number;
+}
+
 /** The fitted comps curve: log(FDV) = intercept + slope x log(TVL), fit by OLS on the live set. */
 export interface CompsCurve {
   /** The OLS intercept, log(FDV) at log(TVL) = 0. */
@@ -171,6 +200,12 @@ export interface CompsCurve {
   slope: number;
   /** R² of the log-log fit on the whole live set. */
   r2: number;
+  /** R² of the curve plus the category offsets, on the whole live set. */
+  category_r2: number;
+  /** The residual standard deviation of the curve plus the category offsets, in log points. */
+  category_residual_sd: number;
+  /** The fitted category offsets, strongest first. */
+  categories: CategoryOffset[];
   /** The live protocols the curve was fit on. */
   n: number;
   /** The residual standard deviation, in log points. */
@@ -195,6 +230,8 @@ export interface ModelValidation {
   /** Median absolute log error on the held-out test set: fitted curve vs one median multiple. */
   fitted_median_log_error: number;
   median_median_log_error: number;
+  /** Median absolute log error of the curve plus the category offsets, on the held-out test set. */
+  category_median_log_error: number;
   /** The median multiple the baseline used, fit on the train half only. */
   train_median_multiple: number;
 }
@@ -283,12 +320,14 @@ export function deriveMultiple(snapshot: Snapshot, model: ModelConstants): { mul
   };
 }
 
-/** The three multipliers and the implied value one protocol gets under `model`. */
+/** The three multipliers and the implied value one protocol gets under `model`. The category
+ * factor multiplies after the clamp: the clamp governs the curve multiple only. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
   baseMultiple: number,
+  categoryFactor = 1,
 ): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
@@ -296,7 +335,7 @@ export function impliedValue(
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const base = protocol.tvl_usd * baseMultiple;
+  const base = protocol.tvl_usd * baseMultiple * categoryFactor;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
   return { implied, growthPct, growthMult, maturityMult, age };
 }
@@ -335,12 +374,46 @@ function liveSet(snapshot: Snapshot): SnapshotProtocol[] {
 }
 
 /**
+ * The category offsets, from the live set and one fitted curve: each category's mean
+ * residual from the curve, shrunk toward zero by (n / (n + k)) so a category with one
+ * live protocol cannot drag the board on a single print. A category with no live
+ * protocol gets no offset, which is a factor of 1. The offsets are rounded to 4 log
+ * points once, here: the board, the validation and the dashboard table all read the
+ * same rounded numbers, so the page and board.json agree to the dollar.
+ */
+export function categoryOffsets(
+  live: SnapshotProtocol[],
+  intercept: number,
+  slope: number,
+  k: number,
+): CategoryOffset[] {
+  const byCat = new Map<string, number[]>();
+  for (const p of live) {
+    const residual = Math.log(p.mcap_usd as number) - (intercept + slope * Math.log(p.tvl_usd));
+    const key = p.category ?? 'Unknown';
+    const list = byCat.get(key);
+    if (list === undefined) byCat.set(key, [residual]);
+    else list.push(residual);
+  }
+  const offsets: CategoryOffset[] = [];
+  for (const [category, residuals] of byCat) {
+    const n = residuals.length;
+    const mean = residuals.reduce((a, r) => a + r, 0) / n;
+    const offsetLog = round4((n / (n + k)) * mean);
+    offsets.push({ category, n, offset_log: offsetLog, factor: round4(Math.exp(offsetLog)) });
+  }
+  offsets.sort((a, b) => b.offset_log - a.offset_log || (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
+  return offsets;
+}
+
+/**
  * The fitted comps curve, from the snapshot's whole live set, plus its out-of-sample
  * validation. The validation splits the live set 80/20 by a seeded hash of the slug, fits the
  * curve on the 80% it is allowed to see, and scores it on the 20% it never saw — and does the
  * same for the old one-median model, so the dashboard can show whether the curve earns its
  * place. The board itself is scored with the curve fit on all live protocols: the split is
- * the test, not the model.
+ * the test, not the model. The category model gets the same test: its offsets are fit on
+ * the train half's residuals only, then applied to the held-out test rows.
  */
 export function fitCompsCurve(
   snapshot: Snapshot,
@@ -356,12 +429,34 @@ export function fitCompsCurve(
   const absErr = (errors: number[]): number => medianOf([...errors].sort((a, b) => a - b), 0);
   const fittedErr = absErr(test.map((p) => Math.abs(Math.log(p.mcap_usd as number) - (trainFit.intercept + trainFit.slope * Math.log(p.tvl_usd)))));
   const medianErr = absErr(test.map((p) => Math.abs(Math.log(p.mcap_usd as number) - (Math.log(p.tvl_usd) + Math.log(trainMedian)))));
+  // The category model, fit the same way: offsets from the full live set for the board,
+  // offsets from the train half only for the honest out-of-sample test.
+  const fullOffsets = categoryOffsets(live, full.intercept, full.slope, model.category_shrink_k);
+  const fullOffsetByCat = new Map(fullOffsets.map((o) => [o.category, o.offset_log]));
+  const meanLogMcap = live.reduce((a, p) => a + Math.log(p.mcap_usd as number), 0) / live.length;
+  let ssResCat = 0;
+  let ssTot = 0;
+  for (const p of live) {
+    const pred = full.intercept + full.slope * Math.log(p.tvl_usd) + (fullOffsetByCat.get(p.category ?? 'Unknown') ?? 0);
+    ssResCat += (Math.log(p.mcap_usd as number) - pred) ** 2;
+    ssTot += (Math.log(p.mcap_usd as number) - meanLogMcap) ** 2;
+  }
+  const categoryR2 = ssTot === 0 ? 0 : 1 - ssResCat / ssTot;
+  const categoryResidualSd = Math.sqrt(ssResCat / live.length);
+  const trainOffsets = categoryOffsets(train, trainFit.intercept, trainFit.slope, model.category_shrink_k);
+  const trainOffsetByCat = new Map(trainOffsets.map((o) => [o.category, o.offset_log]));
+  const categoryErr = absErr(
+    test.map((p) => Math.abs(Math.log(p.mcap_usd as number) - (trainFit.intercept + trainFit.slope * Math.log(p.tvl_usd) + (trainOffsetByCat.get(p.category ?? 'Unknown') ?? 0)))),
+  );
   const { multiple: medianMultiple, derivation: median } = deriveMultiple(snapshot, model);
   return {
     curve: {
       intercept: round2(full.intercept),
       slope: round2(full.slope),
       r2: round2(full.r2),
+      category_r2: round2(categoryR2),
+      category_residual_sd: round2(categoryResidualSd),
+      categories: fullOffsets,
       n: live.length,
       residual_sd: round2(full.residualSd),
       multiple_floor: model.multiple_floor,
@@ -377,6 +472,7 @@ export function fitCompsCurve(
       train_r2: round2(trainFit.r2),
       fitted_median_log_error: round2(fittedErr),
       median_median_log_error: round2(medianErr),
+      category_median_log_error: round2(categoryErr),
       train_median_multiple: round4(trainMedian),
     },
     medianMultiple,
@@ -508,18 +604,22 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
 
   let atFloor = 0;
   let atCap = 0;
+  const offsetByCat = new Map(curve.categories.map((c) => [c.category, c.factor]));
   const scored = [...chosen.values()].map((p) => {
     // The multiple is read off the fitted curve at this protocol's own TVL: a large protocol
     // trades at a lower multiple than a small one, and the clamp keeps either end sane.
+    // The category factor multiplies after the clamp, so the clamp governs the curve
+    // multiple only; a category with no live protocol scores a factor of 1.
     const raw = rawMultiple(p.tvl_usd, curve);
     if (raw <= model.multiple_floor) atFloor++;
     else if (raw >= model.multiple_cap) atCap++;
     const baseMultiple = fittedMultiple(p.tvl_usd, curve);
-    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, baseMultiple);
+    const categoryFactor = offsetByCat.get(p.category ?? 'Unknown') ?? 1;
+    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, baseMultiple, categoryFactor);
     // The risk signal is scored from the same record, beside the implied value: it never
     // changes the ranking, it only warns the reader how steady the protocol behind it is.
     const risk = riskSignal(p, age);
-    return { p, implied, growthPct, growthMult, maturityMult, age, risk, baseMultiple };
+    return { p, implied, growthPct, growthMult, maturityMult, age, risk, baseMultiple, categoryFactor };
   });
   curve.at_floor = atFloor;
   curve.at_cap = atCap;
@@ -542,12 +642,15 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     risk: s.risk,
     model: {
       base_multiple: round4(s.baseMultiple),
+      category_factor: round4(s.categoryFactor),
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age, s.risk.label, s.baseMultiple, s.growthMult, s.maturityMult).map(stepText),
+    // The farm plan's expected airdrop is priced at this row's implied multiple: the curve
+    // multiple times the category factor, the same multiple the implied value is built on.
+    farm_steps: farmSteps(s.p, s.age, s.risk.label, s.baseMultiple * s.categoryFactor, s.growthMult, s.maturityMult).map(stepText),
   }));
   return { board, baseMultiple: medianMultiple, derivation, curve, validation };
 }
@@ -815,6 +918,7 @@ export function radarRow(row: BoardRow, onWatchlist: boolean): RadarRow {
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
     base_multiple: row.model.base_multiple,
+    category_factor: row.model.category_factor,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     on_watchlist: onWatchlist,

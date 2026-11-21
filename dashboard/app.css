@@ -139,6 +139,11 @@ tbody tr[data-selected="true"] { background: rgba(52, 211, 153, 0.10); }
 .derived div { border: 1px solid var(--border); border-radius: var(--radius-control); padding: var(--s3) var(--s4); display: grid; gap: 2px; }
 .derived span { color: var(--muted); font-size: 12px; }
 .derived b { font-family: var(--font-num); font-size: 15px; font-weight: 500; }
+/* Category offset table: compact three-column list, one line per fitted category. */
+.catgrid { columns: 3; column-gap: var(--s4); font-size: 12px; }
+.catgrid div { display: flex; justify-content: space-between; gap: var(--s2); padding: 3px 0; border-bottom: 1px solid var(--border); break-inside: avoid; }
+.catgrid span { color: var(--muted); }
+.catgrid b { font-family: var(--font-num); font-weight: 500; white-space: nowrap; }
 .empty { padding: var(--s7) var(--s5); text-align: center; display: grid; gap: var(--s3); justify-items: center; }
 .empty p { color: var(--muted); }
 .button { min-height: 36px; padding: 0 var(--s4); border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface-2); color: var(--ink); }

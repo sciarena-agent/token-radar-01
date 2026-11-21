@@ -16,7 +16,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { MODEL, boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -87,5 +87,6 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside), fitted curve logFDV = ${radar.curve.intercept} + ${radar.curve.slope} x logTVL (R2 ${radar.curve.r2}, n=${radar.curve.n}; out-of-sample median log error fitted ${radar.validation.fitted_median_log_error} vs median ${radar.validation.median_median_log_error} on ${radar.validation.test_n} held out)\n` +
+    `token radar: category model logFDV = curve + offset(category), ${radar.curve.categories.length} categories, R2 ${radar.curve.category_r2}, residual SD ${radar.curve.category_residual_sd}, out-of-sample median log error ${radar.validation.category_median_log_error} (k=${MODEL.category_shrink_k} shrinkage)\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')}, ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

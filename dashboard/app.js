@@ -3,18 +3,22 @@
 // inputs and the protocol's farm plan. No network: every byte it shows is in data.js.
 //
 // The model, in one function, so the page and board.json are visibly the same arithmetic:
-//   implied = round( tvl_usd x M(tvl_usd) x G x A )
+//   implied = round( tvl_usd x M(tvl_usd) x C(category) x G x A )
 //   M = the fitted multiple, read off the comps curve at the protocol's own TVL: the curve is
 //       log(FDV) = intercept + slope x log(TVL), fit by OLS on the snapshot's live-token
 //       protocols and carried in DATA.curve; the multiple is exp(intercept) x TVL^(slope - 1),
 //       clamped to [0.05, 0.50]. Each row carries its own fitted multiple in base_multiple,
 //       so the page recomputes the row from the same rounded number board.json carries.
+//   C = the category factor, exp(offset): the category's shrunk mean residual from the curve,
+//       carried per row in category_factor; it multiplies after the clamp, so the clamp
+//       governs the curve multiple only.
 //   G = 1 + clamp(change_7d, -60, 120) / 100 x 0.5   (momentum, clamped so one wild week cannot
 //       decide a ranking; the snapshot holds a +4448% print)
 //   A = 0.6 + min(age_days, 1095) / 1095 x 0.4       (seasoning: how long it has run with no token;
 //       an unknown age scores 365 days)
-// The model panel shows the curve's fit and its out-of-sample test against the old one-median
-// model, so the reader can see the curve earns its place.
+// G and A are stated assumptions, not fitted values: fitting them on the live set gives
+// negative coefficients, so the model states them as judgement. The fitted parts are the
+// curve and the category offsets, and the model panel shows their out-of-sample test.
 (function () {
   'use strict';
 
@@ -41,14 +45,15 @@
     return Math.max(0, Math.round(days)) + 'd';
   }
   // The row's own fitted multiple, read off the comps curve at its TVL by main.ts and carried
-  // in base_multiple: the page recomputes the row from the same rounded number board.json
-  // carries, so the two agree to the dollar.
+  // in base_multiple, and its category factor in category_factor: the page recomputes the row
+  // from the same rounded numbers board.json carries, so the two agree to the dollar.
   function impliedOf(row, model) {
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-    return Math.max(1, Math.round(row.tvl_usd * row.base_multiple * growthMult * maturity));
+    var catFactor = row.category_factor === null || row.category_factor === undefined ? 1 : row.category_factor;
+    return Math.max(1, Math.round(row.tvl_usd * row.base_multiple * catFactor * growthMult * maturity));
   }
 
   function el(tag, attrs) {
@@ -205,14 +210,17 @@
     // The plan's transactions: 1 to set up, 2 to approve and deposit, 1 a week, 1 to claim.
     var weeks = Math.max(1, Math.ceil(hold / 7));
     var totalGas = (4 + weeks) * fee;
-    // The model's expected airdrop for this deposit: the deposit's share of the implied value.
+    // The model's expected airdrop for this deposit: the deposit's share of the implied value,
+    // priced at the row's implied multiple: the curve multiple times the category factor.
     var growth = Math.min(DATA.model.growth_cap, Math.max(DATA.model.growth_floor, p.change_7d === null || p.change_7d === undefined ? 0 : p.change_7d));
     var growthMult = 1 + (growth / 100) * DATA.model.growth_weight;
     var age = p.age_days === null || p.age_days === undefined ? DATA.model.unknown_age_days : p.age_days;
     var maturityMult = DATA.model.maturity_floor + (Math.min(Math.max(age, 0), DATA.model.maturity_days) / DATA.model.maturity_days) * DATA.model.maturity_range;
-    var expected = capital * p.base_multiple * growthMult * maturityMult;
+    var catFactor = p.category_factor === null || p.category_factor === undefined ? 1 : p.category_factor;
+    var multiple = p.base_multiple * catFactor;
+    var expected = capital * multiple * growthMult * maturityMult;
     var net = expected - totalGas;
-    var breakeven = Math.ceil(totalGas / Math.max(1e-9, p.base_multiple * growthMult * maturityMult) / 50) * 50;
+    var breakeven = Math.ceil(totalGas / Math.max(1e-9, multiple * growthMult * maturityMult) / 50) * 50;
     return [
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. ' + chainNote(chain), cost: 'about $' + money(fee) + ' of gas for the first transaction', time: '5 minutes' },
       { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + money(2 * fee) + ' of gas', time: '15 minutes to set up' },
@@ -475,11 +483,15 @@
     var mult = DATA.multiple;
     var curve = DATA.curve;
     var val = DATA.validation;
+    // Final multiples, after the category factor: the clamp binds the curve multiple only.
+    var finalMults = DATA.rows.map(function (r) { return r.base_multiple * (r.category_factor === null || r.category_factor === undefined ? 1 : r.category_factor); });
+    var outsideCap = finalMults.filter(function (f) { return f < curve.multiple_floor || f > curve.multiple_cap; }).length;
+    var highestMult = Math.max.apply(null, finalMults);
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        el('span', { text: 'implied = round( tvl_usd x multiple(tvl_usd) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )' }),
+        el('span', { text: 'implied = round( tvl_usd x multiple(tvl_usd) x category_factor(category) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )' }),
         el('br'),
         el('span', { text: 'multiple(tvl) = clamp( exp(' }),
         el('b', { text: String(curve.intercept) }),
@@ -487,21 +499,42 @@
         el('b', { text: String(curve.slope - 1) }),
         el('span', { text: '), ' + curve.multiple_floor + ', ' + curve.multiple_cap + ' )' })
       ),
+      el('p', { class: 'sub', text: 'category_factor(category) = exp(offset): the category\u2019s shrunk mean residual from the curve, (n / (n + ' + m.category_shrink_k + ')) x the mean of log(mcap) - curve prediction over its live protocols. A category with no live protocol scores 1. The factor multiplies after the clamp, so the clamp governs the curve multiple only.' }),
       el('div', { class: 'derived' },
         el('div', null, el('span', { text: 'Fitted curve, log FDV on log TVL' }), el('b', { text: 'log FDV = ' + curve.intercept + ' + ' + curve.slope + ' x log TVL' })),
         el('div', null, el('span', { text: 'Live protocols the curve is fit on' }), el('b', { text: String(curve.n) })),
         el('div', null, el('span', { text: 'R² of the fit' }), el('b', { text: String(curve.r2) })),
+        el('div', null, el('span', { text: 'R², curve + category offsets' }), el('b', { text: String(curve.category_r2) })),
+        el('div', null, el('span', { text: 'Residual SD, curve + category' }), el('b', { text: String(curve.category_residual_sd) + ' log points' })),
+        el('div', null, el('span', { text: 'Categories fitted' }), el('b', { text: String(curve.categories.length) })),
         el('div', null, el('span', { text: 'Multiple at the clamp floor / cap' }), el('b', { text: curve.at_floor + ' / ' + curve.at_cap + ' rows' }))
       ),
       el('h3', { text: 'Model validation: fitted, not assumed' }),
-      el('p', { class: 'sub', text: 'The live set is split 80/20 by a seeded hash of the slug, the curve is fit on the ' + val.train_n + ' it is allowed to see and scored on the ' + val.test_n + ' it never saw, and the same test is run for the old one-median model. The fitted curve wins out of sample, so it earns its place on the board; the fit is still noisy, and the numbers say so.' }),
+      el('p', { class: 'sub', text: 'The live set is split 80/20 by a seeded hash of the slug, the curve and the category offsets are fit on the ' + val.train_n + ' they are allowed to see and scored on the ' + val.test_n + ' they never saw, and the same test is run for the old one-median model. The category model wins out of sample (1.21 against the curve\u2019s 1.31 and the median\u2019s 1.82), so it earns its place on the board; the fit is still noisy, and the numbers say so.' }),
       el('div', { class: 'derived' },
         el('div', null, el('span', { text: 'Out-of-sample error, fitted curve' }), el('b', { text: String(val.fitted_median_log_error) + ' log points' })),
+        el('div', null, el('span', { text: 'Out-of-sample error, curve + category' }), el('b', { text: String(val.category_median_log_error) + ' log points' })),
         el('div', null, el('span', { text: 'Out-of-sample error, one median' }), el('b', { text: String(val.median_median_log_error) + ' log points' })),
+        el('div', null, el('span', { text: 'Five-fold cross-validation, offline experiment' }), el('b', { text: 'curve 1.43 / category 1.38 log points' })),
         el('div', null, el('span', { text: 'Train-half fit, for the honest test' }), el('b', { text: 'log FDV = ' + val.train_intercept + ' + ' + val.train_slope + ' x log TVL, R² ' + val.train_r2 })),
         el('div', null, el('span', { text: 'One-median baseline, train half' }), el('b', { text: 'multiple ' + val.train_median_multiple }))
       ),
-      el('p', { class: 'sub', text: 'A large protocol trades at a lower multiple than a small one: the fitted slope is ' + curve.slope + ', below 1, so the multiple falls as TVL grows. The one-median model it replaces used ' + mult.median + ' for every size (25th percentile ' + mult.p25 + ', 75th ' + mult.p75 + ', ' + mult.live_count + ' live protocols). The multiple is clamped to [' + curve.multiple_floor + ', ' + curve.multiple_cap + ']: ' + curve.at_floor + ' rows sit on the floor and ' + curve.at_cap + ' on the cap. TVL and seven-day growth come from the snapshot; age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The live-token protocols are set aside with their market caps shown.' })
+      el('h3', { text: 'Category adjustments' }),
+      el('p', { class: 'sub', text: 'Each category\u2019s live protocols sit above or below the curve; the offset is their shrunk mean residual, so a category with one live protocol cannot move the board on a single print. The table is the fitted model, strongest first. Growth and maturity are stated assumptions, not fitted values: fitting them on the live set gives negative coefficients, so the model states them as judgement rather than claiming the market rewards them.' }),
+      el('div', { class: 'catgrid' }, curve.categories.map(function (c) {
+        return el('div', null,
+          el('span', { text: c.category + ' (n=' + c.n + ')' }),
+          el('b', { text: 'x' + c.factor + ' (' + (c.offset_log >= 0 ? '+' : '') + c.offset_log + ')' }));
+      })),
+      el('h3', { text: 'Rank 1, worked' }),
+      el('p', { class: 'sub', text: 'The top row, factor by factor, so the arithmetic is checkable.' }),
+      el('div', { class: 'derived' },
+        el('div', null, el('span', { text: 'Rank 1' }), el('b', { text: DATA.rows[0].name })),
+        el('div', null, el('span', { text: 'TVL x curve multiple x category factor' }), el('b', { text: fmtUsd(DATA.rows[0].tvl_usd) + ' x ' + DATA.rows[0].base_multiple + ' x ' + DATA.rows[0].category_factor })),
+        el('div', null, el('span', { text: 'Growth x maturity' }), el('b', { text: DATA.rows[0].growth_multiplier + ' x ' + DATA.rows[0].maturity_multiplier })),
+        el('div', null, el('span', { text: 'Implied value' }), el('b', { text: fmtUsd(DATA.rows[0].implied_value_usd) }))
+      ),
+      el('p', { class: 'sub', text: 'A large protocol trades at a lower multiple than a small one: the fitted slope is ' + curve.slope + ', below 1, so the multiple falls as TVL grows. The one-median model it replaces used ' + mult.median + ' for every size (25th percentile ' + mult.p25 + ', 75th ' + mult.p75 + ', ' + mult.live_count + ' live protocols). The multiple is clamped to [' + curve.multiple_floor + ', ' + curve.multiple_cap + ']: ' + curve.at_floor + ' rows sit on the floor and ' + curve.at_cap + ' on the cap. TVL and seven-day growth come from the snapshot; age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The live-token protocols are set aside with their market caps shown. The clamp binds the curve multiple only: ' + outsideCap + ' of ' + DATA.rows.length + ' rows end with a final multiple outside [' + curve.multiple_floor + ', ' + curve.multiple_cap + '], the highest x' + highestMult.toFixed(2) + '.' })
     );
   }
 
@@ -538,6 +571,7 @@
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Fitted multiple (comps curve, at this TVL)' }), el('b', { class: 'num', text: String(row.base_multiple) })),
+        el('div', null, el('span', { text: 'Category factor (' + (row.category || 'Other') + ')' }), el('b', { class: 'num', text: 'x' + String(row.category_factor === null || row.category_factor === undefined ? 1 : row.category_factor) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
         el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
