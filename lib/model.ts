@@ -102,7 +102,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-6';
+export const MODEL_VERSION = 'radar-7';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -134,6 +134,10 @@ export interface FarmEconomics {
   verdict: 'FARM' | 'THIN' | 'SKIP';
   /** The deposit that would turn the plan positive, rounded up to $50, or null when no deposit under $5,000 does. */
   breakeven_usd: number | null;
+  /** The deposit from which the plan pays even at the P25 low end (the verdict flips to FARM), rounded up to $50, or null when no deposit does. */
+  flip_ticket_usd: number | null;
+  /** The launch odds at which the standard ticket nets exactly zero, or null when no odds up to 100% does. */
+  breakeven_odds: number | null;
 }
 
 /** One row of board.json: the ranked board's row. */
@@ -1531,6 +1535,14 @@ export function farmEconomics(
   // Breakeven deposit D: D x multiple x odds - D x tbill_rate x hold/365 = fees.
   const rate = multiple * odds - MODEL.tbill_rate * hold / 365;
   const breakeven = rate <= 0 ? null : Math.ceil(fees / rate / 50) * 50;
+  // Flip ticket: the deposit where the P25 low end turns positive, so the verdict flips
+  // to FARM. Same equation with the low-end rate; fees do not grow with the deposit.
+  const rateLow = multiple * odds * multQ25 - MODEL.tbill_rate * hold / 365;
+  const flipTicket = rateLow <= 0 ? null : Math.ceil(fees / rateLow / 50) * 50;
+  // Break-even odds: the launch chance where this ticket nets exactly zero.
+  // net = ticket x multiple x odds - fees - tbill = 0, so odds = (fees + tbill) / (ticket x multiple).
+  const beOddsRaw = (fees + tbill) / (ticket * multiple);
+  const breakevenOdds = beOddsRaw > 1 ? null : round4(beOddsRaw);
   return {
     ticket,
     slice_usd: round2(slice),
@@ -1544,6 +1556,8 @@ export function farmEconomics(
     per_hour_low_usd: round2(netLow / hours),
     verdict,
     breakeven_usd: breakeven,
+    flip_ticket_usd: flipTicket,
+    breakeven_odds: breakevenOdds,
   };
 }
 
